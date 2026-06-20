@@ -20,9 +20,80 @@ from sdk_helpers import (
     wrap_task_name_with_platform,
 )
 
+RUST_TARGET = "thumbv7m-none-eabi"
+
 
 # Override the default waf task __str__ method to include display of the HW platform being targeted
 Task.__str__ = wrap_task_name_with_platform
+
+
+def _build_rust_staticlib(task):
+    cmd = [
+        "cargo",
+        "build",
+        "--manifest-path",
+        task.generator.rust_manifest.abspath(),
+        "--target",
+        task.generator.rust_target,
+        "--release",
+        "--target-dir",
+        task.generator.rust_target_dir.abspath(),
+    ]
+    return task.exec_command(cmd, cwd=task.generator.rust_manifest.parent.abspath())
+
+
+def _read_cargo_package_name(ctx, manifest):
+    in_package_section = False
+
+    for raw_line in manifest.read().splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_package_section = line == "[package]"
+            continue
+        if not in_package_section or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        if key.strip() != "name":
+            continue
+
+        name = value.strip().strip('"').strip("'")
+        if name:
+            return name.replace("-", "_")
+
+    ctx.fatal("Unable to find [package] name in {}".format(manifest.abspath()))
+
+
+def _rust_staticlib(ctx, rust_manifest):
+    manifest = ctx.path.find_node(rust_manifest)
+    if manifest is None:
+        ctx.fatal("Rust manifest not found: {}".format(rust_manifest))
+
+    manifest_dir = manifest.parent
+    rust_sources = [manifest]
+    for pattern in ("Cargo.lock", ".cargo/config.toml", "src/**/*.rs"):
+        rust_sources.extend(manifest_dir.ant_glob(pattern))
+
+    rust_target_dir = ctx.path.get_bld().make_node(
+        os.path.join(ctx.env.BUILD_DIR, "rust-target")
+    )
+    rust_lib_name = "lib{}.a".format(_read_cargo_package_name(ctx, manifest))
+    rust_lib = rust_target_dir.make_node(
+        os.path.join(RUST_TARGET, "release", rust_lib_name)
+    )
+
+    task_gen = ctx(
+        rule=_build_rust_staticlib,
+        source=rust_sources,
+        target=rust_lib,
+        name="rust-{}".format(ctx.env.PLATFORM_NAME),
+    )
+    task_gen.rust_manifest = manifest
+    task_gen.rust_target = RUST_TARGET
+    task_gen.rust_target_dir = rust_target_dir
+    return rust_lib
 
 
 def options(opt):
@@ -337,6 +408,8 @@ def setup_pebble_cprogram(task_gen):
             getattr(task_gen, "bin_type", "app")
         ),
     ]
+    if getattr(task_gen, "rust_lib", None) is not None:
+        link_flags.append("-Wl,-u,main")
     append_to_attr(task_gen, "linkflags", link_flags)
     # Waf 2.x requires setting LINKFLAGS in the environment, not just the task generator
     if not hasattr(task_gen.env, "LINKFLAGS"):
@@ -411,11 +484,14 @@ def pbl_build(self, *k, **kw):
     """
     valid_bin_types = ("app", "worker", "lib")
     bin_type = kw.get("bin_type", None)
+    rust_manifest = kw.pop("rust_manifest", None)
     if bin_type not in valid_bin_types:
         self.fatal(
             "The pbl_build method requires that a valid bin_type attribute be specified. "
             "Valid options are {}".format(valid_bin_types)
         )
+    if rust_manifest is not None and bin_type == "lib":
+        self.fatal("rust_manifest is only supported for app and worker binaries")
 
     if bin_type in ("app", "worker"):
         kw["features"] = "c cprogram pebble_cprogram memory_usage"
@@ -424,6 +500,10 @@ def pbl_build(self, *k, **kw):
         kw["features"] = "c cstlib memory_usage"
         path, name = kw["target"].rsplit("/", 1)
         kw["lib"] = self.path.find_or_declare(path).make_node("lib{}.a".format(name))
+
+    if rust_manifest is not None:
+        kw["rust_lib"] = _rust_staticlib(self, rust_manifest)
+        kw["features"] = "{} rust_staticlib_link".format(kw["features"])
 
     # Pass values needed for memory usage report
     if bin_type != "worker":
@@ -435,3 +515,11 @@ def pbl_build(self, *k, **kw):
             )
         )
     return self(*k, **kw)
+
+
+@feature("rust_staticlib_link")
+@after_method("apply_link")
+def add_rust_staticlib_to_link(task_gen):
+    rust_lib = getattr(task_gen, "rust_lib", None)
+    if rust_lib is not None:
+        task_gen.link_task.inputs.append(rust_lib)
