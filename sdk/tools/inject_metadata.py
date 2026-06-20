@@ -64,6 +64,7 @@ MAX_WORKER_MEMORY_SIZE = 10 * 1024
 ENTRY_PT_SYMBOL = "main"
 JUMP_TABLE_ADDR_SYMBOL = "pbl_table_addr"
 DEBUG = False
+ABSOLUTE_RELOCATION_TYPES = ("R_ARM_ABS32",)
 
 
 class InvalidBinaryError(Exception):
@@ -115,13 +116,15 @@ def inject_metadata(
             % (symbol)
         )
 
-    def get_virtual_size(elf_file):
-        """returns the virtual size (highest allocated ELF section end) in bytes"""
+    def get_elf_sections(elf_file):
+        """returns ELF section metadata keyed by section name"""
 
-        readelf_bss_process = Popen(
-            "arm-none-eabi-readelf -S '%s'" % elf_file, shell=True, stdout=PIPE
+        readelf_sections_process = Popen(
+            ["arm-none-eabi-readelf", "--wide", "-S", elf_file], stdout=PIPE
         )
-        readelf_bss_output = readelf_bss_process.communicate()[0].decode("utf8")
+        readelf_sections_output = readelf_sections_process.communicate()[0].decode(
+            "utf8"
+        )
 
         # readelf -S output looks like the following...
         #
@@ -133,12 +136,9 @@ def inject_metadata(
         # [ 4] .data             PROGBITS        00000744 008744 000004 00  WA  0   0  4
         # [ 5] .bss              NOBITS          00000748 008748 000054 00  WA  0   0  4
 
-        last_alloc_section_end_addr = 0
+        sections = {}
 
-        # The app heap starts at load_address + virtual_size. Account for every
-        # allocated section so compiler-emitted sections after .data/.bss, such
-        # as .got/.got.plt, remain app-owned memory instead of heap space.
-        for line in readelf_bss_output.splitlines():
+        for line in readelf_sections_output.splitlines():
             if len(line) < 10:
                 continue
 
@@ -152,23 +152,45 @@ def inject_metadata(
             if len(columns) < 7:
                 continue
 
-            flags = columns[6]
-            if "A" not in flags:
+            try:
+                addr = int(columns[2], 16)
+                size = int(columns[4], 16)
+            except ValueError:
                 continue
 
-            addr = int(columns[2], 16)
-            size = int(columns[4], 16)
+            sections[columns[0]] = {
+                "type": columns[1],
+                "addr": addr,
+                "size": size,
+                "flags": columns[6],
+            }
+
+        return sections, readelf_sections_output
+
+    def get_virtual_size(elf_file):
+        """returns the virtual size (highest allocated ELF section end) in bytes"""
+
+        sections, readelf_sections_output = get_elf_sections(elf_file)
+        last_alloc_section_end_addr = 0
+
+        # The app heap starts at load_address + virtual_size. Account for every
+        # allocated section so compiler-emitted sections after .data/.bss, such
+        # as .got/.got.plt, remain app-owned memory instead of heap space.
+        for section in sections.values():
+            if "A" not in section["flags"]:
+                continue
+
             last_alloc_section_end_addr = max(
-                last_alloc_section_end_addr, addr + size
+                last_alloc_section_end_addr, section["addr"] + section["size"]
             )
 
         if last_alloc_section_end_addr != 0:
             return last_alloc_section_end_addr
 
-        sys.stderr.writeline(
+        sys.stderr.write(
             "Failed to parse ELF sections while calculating the virtual size\n"
         )
-        sys.stderr.write(readelf_bss_output)
+        sys.stderr.write(readelf_sections_output)
         raise Exception(
             "Failed to parse ELF sections while calculating the virtual size"
         )
@@ -177,51 +199,78 @@ def inject_metadata(
         """returns a list of all the locations requiring an offset"""
         # TODO: insert link to the wiki page I'm about to write about PIC and relocatable values
         entries = []
+        seen_entries = set()
+        sections, _ = get_elf_sections(elf_file)
 
-        # get the .data locations
+        def add_entry(addr):
+            if addr not in seen_entries:
+                seen_entries.add(addr)
+                entries.append(addr)
+
+        def get_relocation_target_section(relocation_section):
+            if relocation_section.startswith(".rela"):
+                return relocation_section[len(".rela") :]
+            if relocation_section.startswith(".rel"):
+                return relocation_section[len(".rel") :]
+            return None
+
+        def should_relocate_target_section(section_name):
+            section = sections.get(section_name)
+            if section is None:
+                return False
+            if section["type"] == "NOBITS":
+                return False
+            return "A" in section["flags"]
+
+        # Generate runtime relocations from real ELF relocation records wherever
+        # possible. Only absolute word relocations need the app load address
+        # added by the firmware loader; PC-relative calls/jumps and GOT-relative
+        # instruction fixups are already position-independent after link.
         readelf_relocs_process = Popen(
-            ["arm-none-eabi-readelf", "-r", elf_file], stdout=PIPE
+            ["arm-none-eabi-readelf", "--wide", "-r", elf_file], stdout=PIPE
         )
         readelf_relocs_output = readelf_relocs_process.communicate()[0].decode("utf8")
         lines = readelf_relocs_output.splitlines()
 
-        i = 0
-        reading_section = False
-        while i < len(lines):
-            if not reading_section:
-                # look for the next section
-                if lines[i].startswith("Relocation section '.rel.data"):
-                    reading_section = True
-                    i += 1  # skip the column title section
-            else:
-                if len(lines[i]) == 0:
-                    # end of the section
-                    reading_section = False
-                else:
-                    entries.append(int(lines[i].split(" ")[0], 16))
-            i += 1
-
-        # get any Global Offset Table (.got) entries
-        readelf_relocs_process = Popen(
-            ["arm-none-eabi-readelf", "--sections", elf_file], stdout=PIPE
-        )
-        readelf_relocs_output = readelf_relocs_process.communicate()[0].decode("utf8")
-        lines = readelf_relocs_output.splitlines()
+        should_read_relocations = False
         for line in lines:
-            # We shouldn't need to do anything with the Procedure Linkage Table since we don't
-            # actually export functions
-            if ".got" in line and ".got.plt" not in line:
-                words = line.split(" ")
-                while "" in words:
-                    words.remove("")
-                section_label_idx = words.index(".got")
-                addr = int(words[section_label_idx + 2], 16)
-                length = int(words[section_label_idx + 4], 16)
-                for i in range(addr, addr + length, 4):
-                    entries.append(i)
-                break
+            if line.startswith("Relocation section '"):
+                relocation_section = line.split("'", 2)[1]
+                target_section = get_relocation_target_section(relocation_section)
+                should_read_relocations = should_relocate_target_section(
+                    target_section
+                )
+                continue
 
-        return entries
+            if not should_read_relocations:
+                continue
+
+            columns = line.split()
+            if len(columns) < 3:
+                continue
+            if columns[2] not in ABSOLUTE_RELOCATION_TYPES:
+                continue
+
+            try:
+                add_entry(int(columns[0], 16))
+            except ValueError:
+                pass
+
+        # Keep the legacy Global Offset Table fallback: final linked app ELFs do
+        # not necessarily preserve .rel.got, but .got contains app-relative
+        # pointer words that must be adjusted by the loader.
+        got_section = sections.get(".got")
+        if (
+            got_section is not None
+            and got_section["type"] != "NOBITS"
+            and "A" in got_section["flags"]
+        ):
+            for i in range(
+                got_section["addr"], got_section["addr"] + got_section["size"], 4
+            ):
+                add_entry(i)
+
+        return sorted(entries)
 
     nm_output = get_nm_output(target_elf)
 
