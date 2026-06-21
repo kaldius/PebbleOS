@@ -116,7 +116,7 @@ def inject_metadata(
         )
 
     def get_virtual_size(elf_file):
-        """returns the virtual size (static memory usage, .text + .data + .bss) in bytes"""
+        """returns the virtual size (highest allocated ELF section end) in bytes"""
 
         readelf_bss_process = Popen(
             "arm-none-eabi-readelf -S '%s'" % elf_file, shell=True, stdout=PIPE
@@ -133,9 +133,11 @@ def inject_metadata(
         # [ 4] .data             PROGBITS        00000744 008744 000004 00  WA  0   0  4
         # [ 5] .bss              NOBITS          00000748 008748 000054 00  WA  0   0  4
 
-        last_section_end_addr = 0
+        last_alloc_section_end_addr = 0
 
-        # Find the .bss section and calculate the size based on the end of the .bss section
+        # The app heap starts at load_address + virtual_size. Account for every
+        # allocated section so compiler-emitted sections after .data/.bss, such
+        # as .got/.got.plt, remain app-owned memory instead of heap space.
         for line in readelf_bss_output.splitlines():
             if len(line) < 10:
                 continue
@@ -147,20 +149,21 @@ def inject_metadata(
             line = line[line.index("]") + 1 :]
 
             columns = line.split()
-            if len(columns) < 6:
+            if len(columns) < 7:
                 continue
 
-            if columns[0] == ".bss":
-                addr = int(columns[2], 16)
-                size = int(columns[4], 16)
-                last_section_end_addr = addr + size
-            elif columns[0] == ".data" and last_section_end_addr == 0:
-                addr = int(columns[2], 16)
-                size = int(columns[4], 16)
-                last_section_end_addr = addr + size
+            flags = columns[6]
+            if "A" not in flags:
+                continue
 
-        if last_section_end_addr != 0:
-            return last_section_end_addr
+            addr = int(columns[2], 16)
+            size = int(columns[4], 16)
+            last_alloc_section_end_addr = max(
+                last_alloc_section_end_addr, addr + size
+            )
+
+        if last_alloc_section_end_addr != 0:
+            return last_alloc_section_end_addr
 
         sys.stderr.writeline(
             "Failed to parse ELF sections while calculating the virtual size\n"
